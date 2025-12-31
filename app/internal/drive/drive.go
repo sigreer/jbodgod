@@ -11,20 +11,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sigreer/jbodgod/internal/cache"
 	"github.com/sigreer/jbodgod/internal/config"
+	"github.com/sigreer/jbodgod/internal/hba"
 )
 
 type DriveInfo struct {
-	Device   string  `json:"device"`
-	Name     string  `json:"name,omitempty"`
-	State    string  `json:"state"`
-	Temp     *int    `json:"temp"`
-	Serial   *string `json:"serial"`
-	LUID     *string `json:"luid"`
-	SCSIAddr *string `json:"scsi_addr"`
-	Zpool    *string `json:"zpool"`
-	Vdev     *string `json:"vdev"`
-	Model    *string `json:"model"`
+	Device    string  `json:"device"`
+	Name      string  `json:"name,omitempty"`
+	State     string  `json:"state"`
+	Temp      *int    `json:"temp"`
+	Serial    *string `json:"serial"`
+	LUID      *string `json:"luid"`
+	SCSIAddr  *string `json:"scsi_addr"`
+	Zpool     *string `json:"zpool"`
+	Vdev      *string `json:"vdev"`
+	Model     *string `json:"model"`
+	Enclosure *int    `json:"enclosure,omitempty"`
+	Slot      *int    `json:"slot,omitempty"`
 }
 
 type Summary struct {
@@ -36,8 +40,10 @@ type Summary struct {
 }
 
 type Output struct {
-	Drives  []DriveInfo `json:"drives"`
-	Summary Summary     `json:"summary"`
+	Drives      []DriveInfo         `json:"drives"`
+	Summary     Summary             `json:"summary"`
+	Controllers []hba.ControllerInfo `json:"controllers,omitempty"`
+	Enclosures  []hba.EnclosureInfo  `json:"enclosures,omitempty"`
 }
 
 func GetAll(cfg *config.Config) []DriveInfo {
@@ -175,7 +181,7 @@ func PrintStatus(drives []DriveInfo) {
 	}
 }
 
-func PrintJSON(drives []DriveInfo) {
+func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures []hba.EnclosureInfo) {
 	var active, standby int
 	var temps []int
 
@@ -213,8 +219,10 @@ func PrintJSON(drives []DriveInfo) {
 	}
 
 	output := Output{
-		Drives:  drives,
-		Summary: summary,
+		Drives:      drives,
+		Summary:     summary,
+		Controllers: controllers,
+		Enclosures:  enclosures,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
@@ -286,22 +294,330 @@ func Spinup(cfg *config.Config) {
 	fmt.Println("\nAll drives active.")
 }
 
-func Monitor(cfg *config.Config, interval int) {
+// MonitorState holds cached state for efficient updates
+type MonitorState struct {
+	drives         []DriveInfo
+	controllers    []hba.ControllerInfo
+	enclosures     []hba.EnclosureInfo
+	controllerTemp *int
+	lastTempUpdate time.Time
+	lastCtrlUpdate time.Time
+	lastHBAUpdate  time.Time
+	hbaLoaded      bool
+}
+
+// FetchHBAData retrieves controller and enclosure information from HBA tools
+// Returns controllers, enclosures, and any error encountered
+func FetchHBAData(forceRefresh bool) ([]hba.ControllerInfo, []hba.EnclosureInfo, error) {
+	var controllers []hba.ControllerInfo
+	var enclosures []hba.EnclosureInfo
+
+	// Get list of available controllers
+	controllerNums := hba.ListControllers()
+
+	for _, ctrlNum := range controllerNums {
+		ctrl, encs, _, err := hba.GetFullControllerInfo("c"+strconv.Itoa(ctrlNum), forceRefresh)
+		if err != nil {
+			continue
+		}
+		if ctrl != nil {
+			controllers = append(controllers, *ctrl)
+		}
+		enclosures = append(enclosures, encs...)
+	}
+
+	return controllers, enclosures, nil
+}
+
+// getSerialForDevice gets the serial number for a device (cached)
+func getSerialForDevice(device string) string {
+	c := cache.Global()
+	cacheKey := "drive:serial:" + device
+
+	// Check cache first
+	if cached := c.Get(cacheKey); cached != nil {
+		return cached.(string)
+	}
+
+	// Fetch serial
+	out, _ := exec.Command("smartctl", "-i", device).CombinedOutput()
+	re := regexp.MustCompile(`Serial number:\s+(\S+)`)
+	if matches := re.FindStringSubmatch(string(out)); len(matches) > 1 {
+		c.SetStatic(cacheKey, matches[1])
+		return matches[1]
+	}
+	return ""
+}
+
+// checkDriveState does a lightweight check of drive state only (no temp/serial)
+// Uses cache with fast TTL to avoid hammering the drives
+func checkDriveState(device string) string {
+	c := cache.Global()
+	cacheKey := "drive:state:" + device
+
+	// Check cache first
+	if cached := c.Get(cacheKey); cached != nil {
+		return cached.(string)
+	}
+
+	// Fetch fresh state
+	out, _ := exec.Command("smartctl", "-i", "-n", "standby", device).CombinedOutput()
+	state := "active"
+	if strings.Contains(string(out), "NOT READY") {
+		state = "standby"
+	}
+
+	// Cache with fast TTL
+	c.SetFast(cacheKey, state)
+	return state
+}
+
+// getDriveTemp gets temperature for a single drive (only if active)
+// Uses cache with dynamic TTL
+func getDriveTemp(device string) *int {
+	c := cache.Global()
+	cacheKey := "drive:temp:" + device
+
+	// Check cache first
+	if cached := c.Get(cacheKey); cached != nil {
+		temp := cached.(int)
+		return &temp
+	}
+
+	// Fetch fresh temp
+	out, _ := exec.Command("smartctl", "-A", device).CombinedOutput()
+	re := regexp.MustCompile(`Current Drive Temperature:\s+(\d+)`)
+	if matches := re.FindStringSubmatch(string(out)); len(matches) > 1 {
+		if temp, err := strconv.Atoi(matches[1]); err == nil {
+			c.SetDynamic(cacheKey, temp)
+			return &temp
+		}
+	}
+	return nil
+}
+
+// getControllerTemp fetches controller temperature via HBA package
+func getControllerTemp(controller string) *int {
+	temp, _ := hba.FetchControllerTemperature(controller)
+	return temp
+}
+
+// getDeviceHBAInfo fetches enclosure/slot info from HBA
+// Uses cache with static TTL (hardware doesn't change)
+func getDeviceHBAInfo(serial string) (enclosure, slot *int) {
+	if serial == "" {
+		return nil, nil
+	}
+
+	c := cache.Global()
+	cacheKey := "drive:hba:" + serial
+
+	// Check cache first
+	if cached := c.Get(cacheKey); cached != nil {
+		info := cached.([2]*int)
+		return info[0], info[1]
+	}
+
+	// Look up device
+	dev := hba.GetDeviceBySerial(serial)
+	if dev != nil {
+		enc := dev.EnclosureID
+		sl := dev.Slot
+		c.SetStatic(cacheKey, [2]*int{&enc, &sl})
+		return &enc, &sl
+	}
+
+	return nil, nil
+}
+
+// ANSI escape sequences for cursor control
+const (
+	cursorHome    = "\033[H"
+	clearToEnd    = "\033[J"
+	cursorSave    = "\033[s"
+	cursorRestore = "\033[u"
+	hideCursor    = "\033[?25l"
+	showCursor    = "\033[?25h"
+)
+
+// moveCursor moves cursor to row, col (1-indexed)
+func moveCursor(row, col int) {
+	fmt.Printf("\033[%d;%dH", row, col)
+}
+
+// clearLine clears current line from cursor position
+func clearLine() {
+	fmt.Print("\033[K")
+}
+
+// Monitor provides live monitoring with efficient in-place updates
+func Monitor(cfg *config.Config, interval int, tempInterval int, controller string) {
+	drives := cfg.GetAllDrives()
+	state := &MonitorState{
+		drives: make([]DriveInfo, len(drives)),
+	}
+
+	// Initialize drive info with names
+	for i, d := range drives {
+		state.drives[i] = DriveInfo{
+			Device: d.Device,
+			Name:   d.Name,
+			State:  "unknown",
+		}
+	}
+
+	// Pre-load HBA data (background, cached)
+	go func() {
+		// Trigger HBA data fetch to populate cache and store in state
+		controllers, enclosures, _ := FetchHBAData(false)
+		state.controllers = controllers
+		state.enclosures = enclosures
+		state.lastHBAUpdate = time.Now()
+		state.hbaLoaded = true
+	}()
+
+	// Header row positions
+	const headerRow = 1
+	const infoRow = 2
+	const tableHeaderRow = 4
+	const tableDataStart = 6
+
+	// Calculate footer row based on drive count
+	footerRow := tableDataStart + len(drives) + 1
+	summaryRow := footerRow + 1
+	tempStatsRow := footerRow + 2
+	ctrlTempRow := footerRow + 3
+
+	// Initial screen setup
+	fmt.Print("\033[H\033[2J") // Clear screen once
+	fmt.Print(hideCursor)
+
+	// Ensure cursor is shown on exit
+	defer fmt.Print(showCursor)
+
+	// Draw static header
+	moveCursor(headerRow, 1)
+	fmt.Print("=== JBOD Drive Monitor === (Ctrl+C to exit)")
+
+	// Draw table header (with SLOT column)
+	moveCursor(tableHeaderRow, 1)
+	fmt.Printf("%-10s %-8s %-10s %-8s %s", "DRIVE", "SLOT", "STATE", "TEMP", "STATUS")
+	moveCursor(tableHeaderRow+1, 1)
+	fmt.Print("-----------------------------------------------------")
+
+	tickCount := 0
+	tempTicks := tempInterval / interval // How many ticks between temp updates
+	ctrlTicks := 30 / interval           // Controller temp every 30 seconds
+	hbaTicks := 300 / interval           // HBA data every 5 minutes
+	if tempTicks < 1 {
+		tempTicks = 1
+	}
+	if ctrlTicks < 1 {
+		ctrlTicks = 1
+	}
+	if hbaTicks < 1 {
+		hbaTicks = 1
+	}
+
 	for {
-		// Clear screen
-		fmt.Print("\033[H\033[2J")
-		fmt.Println("=== JBOD Drive Monitor === (Ctrl+C to exit)")
-		fmt.Printf("Refreshing every %ds | %s\n\n", interval, time.Now().Format("2006-01-02 15:04:05"))
+		tickCount++
+		shouldUpdateTemps := tickCount == 1 || tickCount%tempTicks == 0
+		shouldUpdateCtrl := controller != "" && (tickCount == 1 || tickCount%ctrlTicks == 0)
+		shouldUpdateHBA := state.hbaLoaded && tickCount%hbaTicks == 0
 
-		drives := GetAll(cfg)
+		// Update timestamp
+		moveCursor(infoRow, 1)
+		clearLine()
+		fmt.Printf("Refreshing every %ds (temps every %ds) | %s",
+			interval, tempInterval, time.Now().Format("2006-01-02 15:04:05"))
 
-		fmt.Printf("%-10s %-10s %-8s %s\n", "DRIVE", "STATE", "TEMP", "STATUS")
-		fmt.Println("-------------------------------------------")
+		// Update drive states (lightweight, every tick)
+		var wg sync.WaitGroup
+		stateResults := make([]string, len(drives))
 
+		for i, d := range drives {
+			wg.Add(1)
+			go func(idx int, device string) {
+				defer wg.Done()
+				stateResults[idx] = checkDriveState(device)
+			}(i, d.Device)
+		}
+		wg.Wait()
+
+		// Apply state results
+		for i, newState := range stateResults {
+			state.drives[i].State = newState
+		}
+
+		// Update temperatures for active drives (less frequent)
+		if shouldUpdateTemps {
+			var tempWg sync.WaitGroup
+			tempResults := make([]*int, len(drives))
+
+			for i, d := range state.drives {
+				if d.State == "active" {
+					tempWg.Add(1)
+					go func(idx int, device string) {
+						defer tempWg.Done()
+						tempResults[idx] = getDriveTemp(device)
+					}(i, drives[i].Device)
+				}
+			}
+			tempWg.Wait()
+
+			// Apply temp results
+			for i, temp := range tempResults {
+				if state.drives[i].State == "active" {
+					state.drives[i].Temp = temp
+				} else {
+					state.drives[i].Temp = nil
+				}
+			}
+			state.lastTempUpdate = time.Now()
+		}
+
+		// Update controller temperature
+		if shouldUpdateCtrl {
+			state.controllerTemp = getControllerTemp(controller)
+			state.lastCtrlUpdate = time.Now()
+		}
+
+		// Refresh HBA data periodically (every 5 minutes)
+		if shouldUpdateHBA {
+			go func() {
+				controllers, enclosures, _ := FetchHBAData(true) // Force refresh
+				state.controllers = controllers
+				state.enclosures = enclosures
+				state.lastHBAUpdate = time.Now()
+			}()
+		}
+
+		// Render drive rows (in-place updates)
 		var active, standby int
 		var temps []int
 
-		for _, d := range drives {
+		for i, d := range state.drives {
+			row := tableDataStart + i
+			moveCursor(row, 1)
+			clearLine()
+
+			// Get slot info if HBA data is loaded and we don't have it yet
+			if state.hbaLoaded && d.Enclosure == nil {
+				serial := getSerialForDevice(drives[i].Device)
+				if serial != "" {
+					enc, slot := getDeviceHBAInfo(serial)
+					state.drives[i].Enclosure = enc
+					state.drives[i].Slot = slot
+					d = state.drives[i] // Refresh local copy
+				}
+			}
+
+			// Format slot info
+			slotStr := "-"
+			if d.Enclosure != nil && d.Slot != nil {
+				slotStr = fmt.Sprintf("%d:%d", *d.Enclosure, *d.Slot)
+			}
+
 			temp := "-"
 			status := "💤"
 
@@ -318,17 +634,27 @@ func Monitor(cfg *config.Config, interval int) {
 					} else {
 						status = "🟢 OK"
 					}
+				} else {
+					status = "⏳" // Active but temp not yet fetched
 				}
 			} else {
 				standby++
 			}
 
-			fmt.Printf("%-10s %-10s %-8s %s\n", d.Device, strings.ToUpper(d.State), temp, status)
+			fmt.Printf("%-10s %-8s %-10s %-8s %s", d.Device, slotStr, strings.ToUpper(d.State), temp, status)
 		}
 
-		fmt.Println("\n-------------------------------------------")
-		fmt.Printf("Active: %d | Standby: %d\n", active, standby)
+		// Update summary section
+		moveCursor(footerRow, 1)
+		clearLine()
+		fmt.Print("-----------------------------------------------------")
 
+		moveCursor(summaryRow, 1)
+		clearLine()
+		fmt.Printf("Active: %d | Standby: %d", active, standby)
+
+		moveCursor(tempStatsRow, 1)
+		clearLine()
 		if len(temps) > 0 {
 			min, max, sum := temps[0], temps[0], 0
 			for _, t := range temps {
@@ -341,8 +667,28 @@ func Monitor(cfg *config.Config, interval int) {
 				sum += t
 			}
 			avg := sum / len(temps)
-			fmt.Printf("Temps: Min %d°C | Max %d°C | Avg %d°C\n", min, max, avg)
+			fmt.Printf("Temps: Min %d°C | Max %d°C | Avg %d°C", min, max, avg)
 		}
+
+		// Controller temperature
+		if controller != "" {
+			moveCursor(ctrlTempRow, 1)
+			clearLine()
+			if state.controllerTemp != nil {
+				ctrlStatus := "🟢"
+				if *state.controllerTemp >= 80 {
+					ctrlStatus = "🔴"
+				} else if *state.controllerTemp >= 70 {
+					ctrlStatus = "🟡"
+				}
+				fmt.Printf("Controller %s: %d°C %s", controller, *state.controllerTemp, ctrlStatus)
+			} else {
+				fmt.Printf("Controller %s: -", controller)
+			}
+		}
+
+		// Move cursor to a safe spot (below all content)
+		moveCursor(ctrlTempRow+2, 1)
 
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
