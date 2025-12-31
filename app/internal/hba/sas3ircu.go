@@ -242,6 +242,7 @@ func GetDeviceBySASAddress(sasAddr string) *PhysicalDevice {
 }
 
 // GetDeviceBySerial looks up a device by serial number
+// Matches against both Serial (short form) and SerialVPD (full form)
 func GetDeviceBySerial(serial string) *PhysicalDevice {
 	serial = strings.ToUpper(strings.TrimSpace(serial))
 
@@ -251,7 +252,16 @@ func GetDeviceBySerial(serial string) *PhysicalDevice {
 	}
 
 	for _, d := range devices {
+		// Check exact match on Serial (short form)
 		if strings.ToUpper(d.Serial) == serial {
+			return &d
+		}
+		// Check exact match on SerialVPD (full form from smartctl)
+		if strings.ToUpper(d.SerialVPD) == serial {
+			return &d
+		}
+		// Check if input starts with short serial (prefix match)
+		if d.Serial != "" && strings.HasPrefix(serial, strings.ToUpper(d.Serial)) {
 			return &d
 		}
 	}
