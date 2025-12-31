@@ -1,0 +1,36 @@
+enclosures:
+  - name: jbod1
+    drives:
+      - name: bay1
+        device: /dev/sdh
+      - name: bay2
+        device: /dev/sdi
+      - name: bay3
+        device: /dev/sdj
+      - name: bay4
+        device: /dev/sdk
+      - name: bay5
+        device: /dev/sdl
+      - name: bay6
+        device: /dev/sdm
+      - name: bay7
+        device: /dev/sdn
+      - name: bay8
+        device: /dev/sdo
+      - name: bay9
+        device: /dev/sdp
+      - name: bay10
+        device: /dev/sdq
+      - name: bay11
+        device: /dev/sdr
+      - name: bay12
+        device: /dev/sds
+
+thresholds:
+  warning_temp: 55
+  critical_temp: 60
+  action_on_critical: alert  # alert, spindown, or notify
+
+alerts:
+  email: admin@example.com
+  webhook: http://localhost:8080/alerts
