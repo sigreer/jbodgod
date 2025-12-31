@@ -104,6 +104,7 @@ func init() {
 	rootCmd.AddCommand(monitorCmd)
 	rootCmd.AddCommand(identifyCmd)
 	rootCmd.AddCommand(detailCmd)
+	rootCmd.AddCommand(locateCmd)
 }
 
 func main() {
