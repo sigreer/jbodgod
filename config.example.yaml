@@ -1,30 +1,29 @@
-enclosures:
-  - name: jbod1
-    drives:
-      - name: bay1
-        device: /dev/sdh
-      - name: bay2
-        device: /dev/sdi
-      - name: bay3
-        device: /dev/sdj
-      - name: bay4
-        device: /dev/sdk
-      - name: bay5
-        device: /dev/sdl
-      - name: bay6
-        device: /dev/sdm
-      - name: bay7
-        device: /dev/sdn
-      - name: bay8
-        device: /dev/sdo
-      - name: bay9
-        device: /dev/sdp
-      - name: bay10
-        device: /dev/sdq
-      - name: bay11
-        device: /dev/sdr
-      - name: bay12
-        device: /dev/sds
+# JBODgod Configuration
+#
+# Drive Discovery Modes:
+#   auto   - (default) Try HBA discovery first, fall back to lsscsi
+#   lsscsi - Use lsscsi to discover SCSI/SAS/SATA drives
+#   hba    - Use sas3ircu/storcli to discover drives via HBA controller
+#   static - Use explicitly configured drives (requires enclosures section)
+#
+# If discovery is not set and enclosures are defined, static mode is used.
+# If discovery is not set and no enclosures are defined, auto mode is used.
+
+# Uncomment to force a specific discovery mode:
+# discovery: auto
+
+# Static drive configuration (optional - only needed for static mode)
+# When using dynamic discovery, this section can be omitted entirely.
+#
+# Example static configuration:
+# enclosures:
+#   - name: jbod1
+#     drives:
+#       - name: bay1
+#         device: /dev/sda
+#       - name: bay2
+#         device: /dev/sdb
+#       # ... add more drives as needed
 
 thresholds:
   warning_temp: 55

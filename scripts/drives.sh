@@ -1,12 +1,27 @@
 #!/bin/bash
 # JBOD SAS Drive Management Script
-# Manages 12x SAS drives (sdh-sds) in zpool
+# Dynamically discovers and manages SAS/SATA drives
 
 if [ "$EUID" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
-DRIVES="sdh sdi sdj sdk sdl sdm sdn sdo sdp sdq sdr sds"
+# Dynamic drive discovery via lsscsi
+# Finds all disk devices attached via SCSI/SAS/SATA
+discover_drives() {
+    # Use lsscsi to find disk devices, extract device names
+    lsscsi 2>/dev/null | grep ' disk ' | awk '{print $NF}' | sed 's|/dev/||' | sort
+}
+
+# Populate DRIVES variable dynamically
+DRIVES=$(discover_drives)
+DRIVE_COUNT=$(echo "$DRIVES" | wc -w)
+
+if [ -z "$DRIVES" ]; then
+    echo "Error: No drives discovered. Is lsscsi installed?"
+    exit 1
+fi
+
 REFRESH_INTERVAL=${2:-5}
 
 usage() {
@@ -277,7 +292,7 @@ spindown() {
             fi
         done
         
-        printf "\r  Progress: %d/12 drives in standby..." $stopped_count
+        printf "\r  Progress: %d/%d drives in standby..." $stopped_count $DRIVE_COUNT
         ((attempt++))
     done
     
@@ -315,7 +330,7 @@ spinup() {
             fi
         done
         
-        printf "\r  Progress: %d/12 drives active..." $active_count
+        printf "\r  Progress: %d/%d drives active..." $active_count $DRIVE_COUNT
         ((attempt++))
     done
     
@@ -341,7 +356,9 @@ poweroff_drives() {
     echo "=== Safe Power Off Sequence ==="
     echo ""
     echo "Step 1: Exporting zpool (if applicable)..."
-    zpool_name=$(zpool status 2>/dev/null | grep -B5 "sdh" | head -1 | awk '{print $2}')
+    # Find zpool using first discovered drive
+    first_drive=$(echo $DRIVES | awk '{print $1}')
+    zpool_name=$(zpool status 2>/dev/null | grep -B5 "$first_drive" | head -1 | awk '{print $2}')
     if [ -n "$zpool_name" ]; then
         echo "  Found zpool: $zpool_name"
         read -p "  Export zpool $zpool_name? (y/N): " confirm
@@ -368,16 +385,18 @@ poweroff_drives() {
 }
 
 settings() {
-    state=$(check_state sdh)
+    # Use first discovered drive for settings
+    first_drive=$(echo $DRIVES | awk '{print $1}')
+    state=$(check_state $first_drive)
     if [ "$state" = "standby" ]; then
-        echo "Drive sdh is in standby. Spinning up to read settings..."
-        sdparm --command=start /dev/sdh >/dev/null 2>&1
+        echo "Drive $first_drive is in standby. Spinning up to read settings..."
+        sdparm --command=start /dev/$first_drive >/dev/null 2>&1
         sleep 3
     fi
-    
-    echo "Power settings for first drive (sdh):"
+
+    echo "Power settings for first drive ($first_drive):"
     echo ""
-    sdparm --page=0x1a /dev/sdh 2>/dev/null | grep -E "IDLE_A|IDLE_B|IDLE_C|STANDBY_Y|STANDBY_Z|IACT|IBCT|ICCT|SYCT|SZCT"
+    sdparm --page=0x1a /dev/$first_drive 2>/dev/null | grep -E "IDLE_A|IDLE_B|IDLE_C|STANDBY_Y|STANDBY_Z|IACT|IBCT|ICCT|SYCT|SZCT"
     echo ""
     echo "Timer values are in 100ms units (e.g., 9000 = 15 min)"
 }
