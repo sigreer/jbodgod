@@ -31,3 +31,7 @@ config.yaml
 # Build
 /dist/
 /build/
+
+# Tool output logs
+*.log
+storcli-output.txt
