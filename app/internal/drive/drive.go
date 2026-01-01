@@ -32,11 +32,13 @@ type DriveInfo struct {
 }
 
 type Summary struct {
-	Active   int  `json:"active"`
-	Standby  int  `json:"standby"`
-	TempMin  *int `json:"temp_min"`
-	TempMax  *int `json:"temp_max"`
-	TempAvg  *int `json:"temp_avg"`
+	Active  int  `json:"active"`
+	Standby int  `json:"standby"`
+	Missing int  `json:"missing"`
+	Failed  int  `json:"failed"`
+	TempMin *int `json:"temp_min"`
+	TempMax *int `json:"temp_max"`
+	TempAvg *int `json:"temp_avg"`
 }
 
 type Output struct {
@@ -70,8 +72,24 @@ func getInfo(d config.Drive) DriveInfo {
 	}
 
 	// Check state
-	out, _ := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
+	out, err := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
 	output := string(out)
+
+	// Check for device access failures first
+	if err != nil {
+		// Device doesn't exist or can't be opened
+		if strings.Contains(output, "No such device") ||
+			strings.Contains(output, "No such file") {
+			info.State = "missing"
+			return info
+		}
+		// Device exists but failed to respond (I/O error, etc.)
+		if strings.Contains(output, "I/O error") ||
+			strings.Contains(output, "failed") {
+			info.State = "failed"
+			return info
+		}
+	}
 
 	if strings.Contains(output, "NOT READY") {
 		info.State = "standby"
@@ -182,23 +200,33 @@ func PrintStatus(drives []DriveInfo) {
 }
 
 func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures []hba.EnclosureInfo) {
-	var active, standby int
+	var active, standby, missing, failed int
 	var temps []int
 
 	for _, d := range drives {
-		if d.State == "active" {
+		switch d.State {
+		case "active":
 			active++
 			if d.Temp != nil {
 				temps = append(temps, *d.Temp)
 			}
-		} else {
+		case "standby":
 			standby++
+		case "missing":
+			missing++
+		case "failed":
+			failed++
+		default:
+			// Unknown state, count as failed
+			failed++
 		}
 	}
 
 	summary := Summary{
 		Active:  active,
 		Standby: standby,
+		Missing: missing,
+		Failed:  failed,
 	}
 
 	if len(temps) > 0 {
@@ -361,10 +389,27 @@ func checkDriveState(device string) string {
 	}
 
 	// Fetch fresh state
-	out, _ := exec.Command("smartctl", "-i", "-n", "standby", device).CombinedOutput()
-	state := "active"
-	if strings.Contains(string(out), "NOT READY") {
+	out, err := exec.Command("smartctl", "-i", "-n", "standby", device).CombinedOutput()
+	output := string(out)
+
+	var state string
+
+	// Check for device access failures first
+	if err != nil {
+		if strings.Contains(output, "No such device") ||
+			strings.Contains(output, "No such file") {
+			state = "missing"
+		} else if strings.Contains(output, "I/O error") ||
+			strings.Contains(output, "failed") {
+			state = "failed"
+		} else {
+			// Unknown error, mark as failed
+			state = "failed"
+		}
+	} else if strings.Contains(output, "NOT READY") {
 		state = "standby"
+	} else {
+		state = "active"
 	}
 
 	// Cache with fast TTL
@@ -593,7 +638,7 @@ func Monitor(cfg *config.Config, interval int, tempInterval int, controller stri
 		}
 
 		// Render drive rows (in-place updates)
-		var active, standby int
+		var active, standby, missing, failed int
 		var temps []int
 
 		for i, d := range state.drives {
@@ -602,7 +647,7 @@ func Monitor(cfg *config.Config, interval int, tempInterval int, controller stri
 			clearLine()
 
 			// Get slot info if HBA data is loaded and we don't have it yet
-			if state.hbaLoaded && d.Enclosure == nil {
+			if state.hbaLoaded && d.Enclosure == nil && d.State == "active" {
 				serial := getSerialForDevice(drives[i].Device)
 				if serial != "" {
 					enc, slot := getDeviceHBAInfo(serial)
@@ -619,9 +664,10 @@ func Monitor(cfg *config.Config, interval int, tempInterval int, controller stri
 			}
 
 			temp := "-"
-			status := "💤"
+			var status string
 
-			if d.State == "active" {
+			switch d.State {
+			case "active":
 				active++
 				if d.Temp != nil {
 					temp = fmt.Sprintf("%d°C", *d.Temp)
@@ -637,8 +683,18 @@ func Monitor(cfg *config.Config, interval int, tempInterval int, controller stri
 				} else {
 					status = "⏳" // Active but temp not yet fetched
 				}
-			} else {
+			case "standby":
 				standby++
+				status = "💤"
+			case "missing":
+				missing++
+				status = "❌ MISSING"
+			case "failed":
+				failed++
+				status = "⛔ FAILED"
+			default:
+				failed++
+				status = "⚠️  UNKNOWN"
 			}
 
 			fmt.Printf("%-10s %-8s %-10s %-8s %s", d.Device, slotStr, strings.ToUpper(d.State), temp, status)
@@ -651,7 +707,14 @@ func Monitor(cfg *config.Config, interval int, tempInterval int, controller stri
 
 		moveCursor(summaryRow, 1)
 		clearLine()
-		fmt.Printf("Active: %d | Standby: %d", active, standby)
+		summaryParts := []string{fmt.Sprintf("Active: %d", active), fmt.Sprintf("Standby: %d", standby)}
+		if missing > 0 {
+			summaryParts = append(summaryParts, fmt.Sprintf("Missing: %d", missing))
+		}
+		if failed > 0 {
+			summaryParts = append(summaryParts, fmt.Sprintf("Failed: %d", failed))
+		}
+		fmt.Print(strings.Join(summaryParts, " | "))
 
 		moveCursor(tempStatsRow, 1)
 		clearLine()
