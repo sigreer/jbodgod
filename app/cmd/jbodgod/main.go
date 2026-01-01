@@ -105,6 +105,8 @@ func init() {
 	rootCmd.AddCommand(identifyCmd)
 	rootCmd.AddCommand(detailCmd)
 	rootCmd.AddCommand(locateCmd)
+	rootCmd.AddCommand(inventoryCmd)
+	rootCmd.AddCommand(healthcheckCmd)
 }
 
 func main() {
