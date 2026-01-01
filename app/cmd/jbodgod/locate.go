@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sigreer/jbodgod/internal/db"
 	"github.com/sigreer/jbodgod/internal/ses"
 	"github.com/spf13/cobra"
 )
@@ -39,11 +40,17 @@ var locateCmd = &cobra.Command{
 The identifier can be any unique device identifier:
   - Device path: /dev/sda, /dev/disk/by-id/...
   - Serial number: WCK5NWKQ
+  - Enclosure:Slot: 2:5 (directly specify bay location)
   - WWN: 0x5000c500d006891c
   - LUID: 5000c500d006891c
   - ZFS pool/vdev GUID
   - Partition UUID
   - And many more...
+
+For failed/missing drives, the command will:
+  1. Try live device lookup first
+  2. Check inventory database for last-known location
+  3. Support enclosure:slot format for direct bay access
 
 Modes:
   (default)    Flash LED for --timeout duration, then turn off
@@ -56,6 +63,7 @@ The --json flag provides machine-readable output for application integration.
 Examples:
   jbodgod locate /dev/sda                    # Flash for 30s
   jbodgod locate --timeout 60s ZA1DKJT7      # Flash for 60s
+  jbodgod locate 2:5                         # Locate by enclosure 2, slot 5
   jbodgod locate --on --json /dev/sda        # Turn on, output JSON
   jbodgod locate --off --json /dev/sda       # Turn off, output JSON
   jbodgod locate --info-only --json /dev/sda # Get location info as JSON`,
@@ -93,8 +101,15 @@ func runLocate(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Get device info first
-	info, err := ses.GetLocateInfo(query)
+	// Try to open database for fallback lookups (optional - don't fail if unavailable)
+	var database *db.DB
+	database, _ = db.New(db.DefaultPath)
+	if database != nil {
+		defer database.Close()
+	}
+
+	// Get device info using fallback logic (supports enclosure:slot, DB serial lookup)
+	info, err := ses.GetLocateInfoWithFallback(query, database)
 	if err != nil {
 		if jsonOut {
 			outputError(err.Error(), info)
