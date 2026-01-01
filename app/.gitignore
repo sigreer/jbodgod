@@ -1,6 +1,6 @@
-# Binary
-jbodgod
-jbodgod.exe
+# Binary (root level only)
+/jbodgod
+/jbodgod.exe
 
 # Test binary
 *.test
