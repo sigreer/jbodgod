@@ -64,10 +64,33 @@ sudo jbodgod monitor -c 0        # Include controller 0 temperature
 
 ### Power Management
 
+JBODgod provides ZFS-aware power management. When spinning down drives that are part of a ZFS pool, you'll be prompted to gracefully export the pool first. This prevents data corruption and enables automatic pool re-import on spinup.
+
 ```bash
-sudo jbodgod spindown            # Spin down all drives
-sudo jbodgod spinup              # Spin up all drives
+# Basic spindown (requires controller or device specification)
+sudo jbodgod spindown -c c0              # Spin down all drives on controller c0
+sudo jbodgod spindown /dev/sda           # Spin down specific drive
+sudo jbodgod spindown /dev/sda /dev/sdb  # Spin down multiple drives
+
+# ZFS handling options
+sudo jbodgod spindown --force-all -c c0  # Export all pools without prompts
+sudo jbodgod spindown --force /dev/sda   # Skip ZFS checks entirely (dangerous!)
+
+# Spinup with automatic pool re-import
+sudo jbodgod spinup -c c0                # Spin up drives, auto-import pools
+sudo jbodgod spinup --no-import -c c0    # Spin up without pool re-import
 ```
+
+**ZFS Workflow:**
+1. `spindown` detects if target drives are part of ZFS pools
+2. Prompts for each pool: "Export pool 'tank'? [y/n]"
+3. If yes: runs `sync` → `zpool sync` → `zpool export`
+4. Records export in database for spinup
+5. Spins down drives
+
+6. `spinup` brings drives online
+7. Checks database for previously exported pools
+8. Automatically imports matching pools
 
 ### Locate a Drive (Flash Enclosure LED)
 
@@ -163,9 +186,10 @@ JBODgod maintains a SQLite database at `/var/lib/jbodgod/inventory.db` for:
 - **Drive inventory** - All drives ever seen, with serial, model, location
 - **State history** - When drives came online, went offline, failed
 - **ZFS health snapshots** - Pool status over time
+- **Exported pools** - Tracks ZFS pools exported during spindown for automatic re-import
 - **Alerts** - Temperature warnings, failures, with acknowledgment tracking
 
-The database is optional - all commands work without it, but `inventory` and `healthcheck` features require it.
+The database is optional - all commands work without it, but `inventory`, `healthcheck`, and automatic pool re-import features require it.
 
 ## Drive States
 

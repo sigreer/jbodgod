@@ -85,6 +85,7 @@ func (d *DB) migrate() error {
 	// Run migrations
 	migrations := []string{
 		migrationV1,
+		migrationV2,
 	}
 
 	for i, migration := range migrations {
@@ -322,3 +323,31 @@ const (
 	CategoryTemperature   = "temperature"
 	CategoryDriveNew      = "drive_new"
 )
+
+// migrationV2 adds exported_pools table for spindown/spinup tracking
+const migrationV2 = `
+-- Track ZFS pools exported for spindown operations
+CREATE TABLE IF NOT EXISTS exported_pools (
+    id INTEGER PRIMARY KEY,
+    pool_name TEXT NOT NULL,
+    export_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    export_reason TEXT DEFAULT 'spindown',
+    drives_json TEXT,
+    imported_timestamp TIMESTAMP,
+    import_status TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_exported_pools_name ON exported_pools(pool_name);
+CREATE INDEX IF NOT EXISTS idx_exported_pools_pending ON exported_pools(imported_timestamp) WHERE imported_timestamp IS NULL;
+`
+
+// ExportedPool represents a pool that was exported for spindown
+type ExportedPool struct {
+	ID                int64
+	PoolName          string
+	ExportTimestamp   time.Time
+	ExportReason      string
+	DrivesJSON        string
+	ImportedTimestamp *time.Time
+	ImportStatus      string
+}

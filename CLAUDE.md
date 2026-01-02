@@ -23,10 +23,12 @@ app/
 │   ├── drive/            # Drive operations (status, spindown, spinup, monitor)
 │   ├── hba/              # HBA controller discovery (storcli, sas3ircu)
 │   ├── ses/              # SES enclosure LED control (sg_ses)
-│   ├── zfs/              # ZFS pool health monitoring
-│   ├── db/               # SQLite inventory database
+│   ├── zfs/              # ZFS pool health, export/import, spindown coordination
+│   ├── db/               # SQLite inventory database + pool tracking
 │   ├── cache/            # TTL-based caching system
-│   └── identify/         # Universal device identification
+│   ├── collector/        # Bulk system data collection (lsblk, blkid, zpool, lvm)
+│   ├── identify/         # Universal device identification
+│   └── version/          # Version constant (MUST increment on changes)
 ├── go.mod
 └── go.sum
 ```
@@ -50,14 +52,24 @@ The app shells out to these Linux utilities (most require root):
 
 | Command | Description |
 |---------|-------------|
+| `version` | Display jbodgod version |
 | `status` | Display drive states and temperatures |
 | `monitor -i N` | Live TUI monitoring with N-second refresh |
-| `spindown` / `spinup` | Power management for all drives |
+| `spindown -c <ctrl>` or `spindown <dev>...` | Spin down drives with ZFS-aware pool export |
+| `spinup [-c <ctrl>] [<dev>...]` | Spin up drives with automatic pool re-import |
 | `locate <id>` | Flash enclosure bay LED for physical drive location |
 | `identify <query>` | Universal device lookup (serial, WWN, GUID, etc.) |
 | `detail <target>` | Query controller or device details |
 | `inventory list\|sync\|show` | Drive inventory database management |
 | `healthcheck` | System health validation |
+
+### Spindown/Spinup Flags
+
+| Flag | Command | Description |
+|------|---------|-------------|
+| `--force` | spindown | Skip all ZFS checks (dangerous) |
+| `--force-all` | spindown | Export all affected pools without prompts |
+| `--no-import` | spinup | Skip automatic ZFS pool re-import |
 
 ## Coding Conventions
 
@@ -88,6 +100,7 @@ Tables:
 - `drives` - Drive inventory with location, serial, state
 - `drive_events` - State transition history
 - `zfs_health` - Pool health snapshots
+- `exported_pools` - ZFS pools exported during spindown (for auto re-import)
 - `alerts` - Alert history with acknowledgment
 
 ## Key Types
@@ -154,6 +167,9 @@ alerts:
 3. **Serial matching:** HBA may report truncated serials; match both short and VPD serials
 4. **Locate fallback:** For failed/missing drives, check inventory DB for last-known location
 5. **ZFS integration:** Uses zpool list -v for vdev membership detection
+6. **ZFS spindown:** Uses blkid UUID_SUB → vdev GUID → pool name mapping via collector package
+7. **Pool export sequence:** `sync` → `zpool sync $pool` → `zpool export $pool` (fail-safe)
+8. **Pool tracking:** Exported pools stored in DB with drive serials for targeted re-import
 
 ## Build
 
@@ -164,3 +180,38 @@ sudo mv jbodgod /usr/local/bin/
 ```
 
 Go version: 1.25+
+
+## Versioning (MANDATORY)
+
+**Location:** `internal/version/version.go`
+
+**IMPORTANT:** The version number MUST be incremented for every build that includes changes.
+
+### Rules
+
+1. **Every change requires a version bump** - No exceptions. This ensures binary provenance.
+2. **Use semantic versioning:** `MAJOR.MINOR.PATCH`
+   - MAJOR: Breaking changes or major features
+   - MINOR: New features, backward compatible
+   - PATCH: Bug fixes, small improvements
+3. **Alpha suffixes for trivial changes:** Append `a`, `b`, `c` etc. for very minor changes that don't warrant a patch increment (e.g., `1.3.0a`, `1.3.0b`)
+4. **Report version after build:** Always state the version number after building so the user can verify the correct binary is in use.
+
+### Workflow
+
+```bash
+# 1. Edit internal/version/version.go and increment version
+# 2. Build
+cd app && go build -o jbodgod ./cmd/jbodgod
+# 3. Report version
+./jbodgod version
+```
+
+### Example
+
+```go
+// internal/version/version.go
+package version
+
+const Version = "1.3.0"  // Increment this for EVERY build with changes
+```

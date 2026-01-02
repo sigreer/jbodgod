@@ -1,6 +1,7 @@
 package drive
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,23 +13,67 @@ import (
 	"time"
 
 	"github.com/sigreer/jbodgod/internal/cache"
+	"github.com/sigreer/jbodgod/internal/collector"
 	"github.com/sigreer/jbodgod/internal/config"
+	"github.com/sigreer/jbodgod/internal/db"
 	"github.com/sigreer/jbodgod/internal/hba"
+	"github.com/sigreer/jbodgod/internal/zfs"
 )
 
+// DriveInfo represents comprehensive drive information
 type DriveInfo struct {
-	Device    string  `json:"device"`
-	Name      string  `json:"name,omitempty"`
-	State     string  `json:"state"`
-	Temp      *int    `json:"temp"`
-	Serial    *string `json:"serial"`
-	LUID      *string `json:"luid"`
-	SCSIAddr  *string `json:"scsi_addr"`
-	Zpool     *string `json:"zpool"`
-	Vdev      *string `json:"vdev"`
-	Model     *string `json:"model"`
-	Enclosure *int    `json:"enclosure,omitempty"`
-	Slot      *int    `json:"slot,omitempty"`
+	// === Identifiers ===
+	Device     string  `json:"device"`
+	Name       string  `json:"name,omitempty"`
+	Serial     *string `json:"serial,omitempty"`
+	SerialVPD  *string `json:"serial_vpd,omitempty"`
+	WWN        *string `json:"wwn,omitempty"`
+	LUID       *string `json:"luid,omitempty"`
+	SASAddress *string `json:"sas_address,omitempty"`
+	ByIDPath   *string `json:"by_id_path,omitempty"`
+
+	// === Hardware ===
+	Model      *string `json:"model,omitempty"`
+	Vendor     *string `json:"vendor,omitempty"`
+	Firmware   *string `json:"firmware,omitempty"`
+	SizeBytes  *int64  `json:"size_bytes,omitempty"`
+	Protocol   *string `json:"protocol,omitempty"`
+	DriveType  *string `json:"drive_type,omitempty"`
+	FormFactor *string `json:"form_factor,omitempty"`
+	SectorSize *int    `json:"sector_size,omitempty"`
+	LinkSpeed  *string `json:"link_speed,omitempty"`
+
+	// === Physical Location ===
+	ControllerID *string `json:"controller_id,omitempty"`
+	Enclosure    *int    `json:"enclosure,omitempty"`
+	Slot         *int    `json:"slot,omitempty"`
+	SCSIAddr     *string `json:"scsi_addr,omitempty"`
+
+	// === Runtime State ===
+	State       string  `json:"state"`
+	Temp        *int    `json:"temp,omitempty"`
+	SmartHealth *string `json:"smart_health,omitempty"`
+
+	// === Storage Stack ===
+	Zpool     *string           `json:"zpool,omitempty"`
+	Vdev      *string           `json:"vdev,omitempty"`
+	VdevGUID  *string           `json:"vdev_guid,omitempty"`
+	ZfsErrors *collector.ZfsErrors `json:"zfs_errors,omitempty"`
+	LvmPV     *string           `json:"lvm_pv,omitempty"`
+	LvmVG     *string           `json:"lvm_vg,omitempty"`
+
+	// === Filesystem ===
+	FSType    *string `json:"fs_type,omitempty"`
+	FSLabel   *string `json:"fs_label,omitempty"`
+	FSUUID    *string `json:"fs_uuid,omitempty"`
+	PartUUID  *string `json:"part_uuid,omitempty"`
+	PartLabel *string `json:"part_label,omitempty"`
+
+	// === SMART Metrics ===
+	PowerOnHours   *int `json:"power_on_hours,omitempty"`
+	Reallocated    *int `json:"reallocated_sectors,omitempty"`
+	PendingSectors *int `json:"pending_sectors,omitempty"`
+	MediaErrors    *int `json:"media_errors,omitempty"`
 }
 
 type Summary struct {
@@ -50,19 +95,71 @@ type Output struct {
 
 func GetAll(cfg *config.Config) []DriveInfo {
 	drives := cfg.GetAllDrives()
-	results := make([]DriveInfo, len(drives))
-	var wg sync.WaitGroup
 
+	// Collect device paths
+	devices := make([]string, len(drives))
+	nameMap := make(map[string]string) // device -> name
 	for i, d := range drives {
-		wg.Add(1)
-		go func(idx int, drv config.Drive) {
-			defer wg.Done()
-			results[idx] = getInfo(drv)
-		}(i, d)
+		devices[i] = d.Device
+		nameMap[d.Device] = d.Name
 	}
 
-	wg.Wait()
+	// Use new collector for bulk data collection
+	driveData := collector.GetAllDriveData(devices, false)
+
+	// Convert to DriveInfo
+	results := make([]DriveInfo, len(driveData))
+	for i, data := range driveData {
+		results[i] = driveDataToInfo(data, nameMap[data.Device])
+	}
+
 	return results
+}
+
+// driveDataToInfo converts collector.DriveData to DriveInfo
+func driveDataToInfo(data *collector.DriveData, name string) DriveInfo {
+	info := DriveInfo{
+		Device:         data.Device,
+		Name:           name,
+		Serial:         data.Serial,
+		SerialVPD:      data.SerialVPD,
+		WWN:            data.WWN,
+		LUID:           data.LUID,
+		SASAddress:     data.SASAddress,
+		ByIDPath:       data.ByIDPath,
+		Model:          data.Model,
+		Vendor:         data.Vendor,
+		Firmware:       data.Firmware,
+		SizeBytes:      data.SizeBytes,
+		Protocol:       data.Protocol,
+		DriveType:      data.DriveType,
+		FormFactor:     data.FormFactor,
+		SectorSize:     data.SectorSize,
+		LinkSpeed:      data.LinkSpeed,
+		ControllerID:   data.ControllerID,
+		Enclosure:      data.Enclosure,
+		Slot:           data.Slot,
+		SCSIAddr:       data.SCSIAddr,
+		State:          data.State,
+		Temp:           data.Temp,
+		SmartHealth:    data.SmartHealth,
+		Zpool:          data.Zpool,
+		Vdev:           data.Vdev,
+		VdevGUID:       data.VdevGUID,
+		ZfsErrors:      data.ZfsErrors,
+		LvmPV:          data.LvmPV,
+		LvmVG:          data.LvmVG,
+		FSType:         data.FSType,
+		FSLabel:        data.FSLabel,
+		FSUUID:         data.FSUUID,
+		PartUUID:       data.PartUUID,
+		PartLabel:      data.PartLabel,
+		PowerOnHours:   data.PowerOnHours,
+		Reallocated:    data.Reallocated,
+		PendingSectors: data.PendingSectors,
+		MediaErrors:    data.MediaErrors,
+	}
+	return info
 }
 
 func getInfo(d config.Drive) DriveInfo {
@@ -75,7 +172,14 @@ func getInfo(d config.Drive) DriveInfo {
 	out, err := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
 	output := string(out)
 
-	// Check for device access failures first
+	// Check for standby FIRST - smartctl returns non-zero exit code for standby drives
+	// but this is not an error condition
+	if strings.Contains(output, "STANDBY") || strings.Contains(output, "NOT READY") {
+		info.State = "standby"
+		return info
+	}
+
+	// Check for device access failures
 	if err != nil {
 		// Device doesn't exist or can't be opened
 		if strings.Contains(output, "No such device") ||
@@ -84,15 +188,12 @@ func getInfo(d config.Drive) DriveInfo {
 			return info
 		}
 		// Device exists but failed to respond (I/O error, etc.)
-		if strings.Contains(output, "I/O error") ||
-			strings.Contains(output, "failed") {
+		if strings.Contains(output, "I/O error") {
 			info.State = "failed"
 			return info
 		}
-	}
-
-	if strings.Contains(output, "NOT READY") {
-		info.State = "standby"
+		// Other errors - mark as failed
+		info.State = "failed"
 		return info
 	}
 
@@ -258,9 +359,79 @@ func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures 
 	enc.Encode(output)
 }
 
-func Spindown(cfg *config.Config) {
-	drives := cfg.GetAllDrives()
-	fmt.Println("Spinning down drives...")
+// filterDrivesByController returns only drives attached to the specified controller.
+// If controller is empty, returns all drives.
+// Uses serial number matching between smartctl output and HBA device data.
+func filterDrivesByController(drives []config.Drive, controller string) []config.Drive {
+	if controller == "" {
+		return drives
+	}
+
+	// Get controller number from ID (e.g., "c0" -> 0)
+	ctrlNum := 0
+	if strings.HasPrefix(controller, "c") {
+		ctrlNum, _ = strconv.Atoi(controller[1:])
+	}
+
+	// Fetch devices from this controller
+	_, _, hbaDevices, err := hba.FetchSas3ircuData(ctrlNum, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch HBA data for %s: %v\n", controller, err)
+		return nil
+	}
+
+	// Build a set of serials attached to this controller
+	hbaSerials := make(map[string]bool)
+	for _, dev := range hbaDevices {
+		if dev.Serial != "" {
+			hbaSerials[strings.ToUpper(dev.Serial)] = true
+		}
+		if dev.SerialVPD != "" {
+			hbaSerials[strings.ToUpper(dev.SerialVPD)] = true
+		}
+	}
+
+	// Match config drives to HBA devices by serial
+	var filtered []config.Drive
+	for _, d := range drives {
+		serial := getSerialForDevice(d.Device)
+		if serial != "" && hbaSerials[strings.ToUpper(serial)] {
+			filtered = append(filtered, d)
+		}
+	}
+
+	return filtered
+}
+
+func Spindown(cfg *config.Config, controller string, devices []string) {
+	var drives []config.Drive
+
+	if len(devices) > 0 {
+		// Specific devices provided - use those directly
+		for _, dev := range devices {
+			drives = append(drives, config.Drive{Device: dev, Name: dev})
+		}
+		fmt.Printf("Spinning down %d specified drive(s)...\n", len(drives))
+	} else {
+		// Filter by controller
+		allDrives := cfg.GetAllDrives()
+		drives = filterDrivesByController(allDrives, controller)
+
+		if len(drives) == 0 {
+			if controller != "" {
+				fmt.Printf("No drives found for controller %s\n", controller)
+			} else {
+				fmt.Println("No drives found")
+			}
+			return
+		}
+
+		if controller != "" {
+			fmt.Printf("Spinning down %d drives on controller %s...\n", len(drives), controller)
+		} else {
+			fmt.Printf("Spinning down %d drives...\n", len(drives))
+		}
+	}
 
 	var wg sync.WaitGroup
 	for _, d := range drives {
@@ -290,9 +461,311 @@ func Spindown(cfg *config.Config) {
 	fmt.Println("\nAll drives in standby.")
 }
 
-func Spinup(cfg *config.Config) {
-	drives := cfg.GetAllDrives()
-	fmt.Println("Spinning up drives...")
+func Spinup(cfg *config.Config, controller string, devices []string) {
+	var drives []config.Drive
+
+	if len(devices) > 0 {
+		// Specific devices provided - use those directly
+		for _, dev := range devices {
+			drives = append(drives, config.Drive{Device: dev, Name: dev})
+		}
+		fmt.Printf("Spinning up %d specified drive(s)...\n", len(drives))
+	} else {
+		// Filter by controller
+		allDrives := cfg.GetAllDrives()
+		drives = filterDrivesByController(allDrives, controller)
+
+		if len(drives) == 0 {
+			if controller != "" {
+				fmt.Printf("No drives found for controller %s\n", controller)
+			} else {
+				fmt.Println("No drives found")
+			}
+			return
+		}
+
+		if controller != "" {
+			fmt.Printf("Spinning up %d drives on controller %s...\n", len(drives), controller)
+		} else {
+			fmt.Printf("Spinning up %d drives...\n", len(drives))
+		}
+	}
+
+	var wg sync.WaitGroup
+	for _, d := range drives {
+		wg.Add(1)
+		go func(device string) {
+			defer wg.Done()
+			exec.Command("sdparm", "--command=start", device).Run()
+		}(d.Device)
+	}
+	wg.Wait()
+
+	// Monitor progress
+	for i := 0; i < 60; i++ {
+		time.Sleep(time.Second)
+		active := 0
+		for _, d := range drives {
+			out, _ := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
+			if !strings.Contains(string(out), "NOT READY") {
+				active++
+			}
+		}
+		fmt.Printf("\r  Progress: %d/%d drives active...", active, len(drives))
+		if active == len(drives) {
+			break
+		}
+	}
+	fmt.Println("\nAll drives active.")
+}
+
+// SpindownOptions controls spindown behavior
+type SpindownOptions struct {
+	Force    bool // Skip all ZFS handling
+	ForceAll bool // Export all pools without prompts
+}
+
+// SpinupOptions controls spinup behavior
+type SpinupOptions struct {
+	NoImport bool // Skip automatic pool import
+}
+
+// SpindownWithZFS performs ZFS-aware spindown
+func SpindownWithZFS(cfg *config.Config, controller string, devices []string, opts SpindownOptions) {
+	// 1. Resolve target drives (same logic as existing Spindown)
+	var drives []config.Drive
+
+	if len(devices) > 0 {
+		for _, dev := range devices {
+			drives = append(drives, config.Drive{Device: dev, Name: dev})
+		}
+	} else {
+		allDrives := cfg.GetAllDrives()
+		drives = filterDrivesByController(allDrives, controller)
+	}
+
+	if len(drives) == 0 {
+		if controller != "" {
+			fmt.Printf("No drives found for controller %s\n", controller)
+		} else {
+			fmt.Println("No drives found")
+		}
+		return
+	}
+
+	// 2. If --force, skip ZFS handling entirely
+	if opts.Force {
+		fmt.Println("--force specified: skipping ZFS pool checks")
+		spindownDrives(drives)
+		return
+	}
+
+	// 3. Get device paths for analysis
+	devicePaths := make([]string, len(drives))
+	for i, d := range drives {
+		devicePaths[i] = d.Device
+	}
+
+	// 4. Analyze ZFS membership
+	zfsPools, nonZfsDrives, err := zfs.AnalyzeSpindownTargets(devicePaths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not analyze ZFS membership: %v\n", err)
+		// Continue without ZFS handling
+		spindownDrives(drives)
+		return
+	}
+
+	// 5. Handle ZFS pools
+	var exportedPools []string
+	var skippedDevices []string
+
+	if len(zfsPools) > 0 {
+		// Open database for tracking (optional)
+		database, dbErr := db.New("")
+		if dbErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: database unavailable, cannot track pool exports: %v\n", dbErr)
+		}
+		if database != nil {
+			defer database.Close()
+		}
+
+		reader := bufio.NewReader(os.Stdin)
+
+		for _, pool := range zfsPools {
+			shouldExport := opts.ForceAll
+
+			if !shouldExport {
+				shouldExport = zfs.PromptForPoolExport(reader, pool)
+			}
+
+			if shouldExport {
+				fmt.Printf("Exporting pool '%s'...\n", pool.PoolName)
+				if err := zfs.ExportPool(pool.PoolName); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: failed to export pool '%s': %v\n", pool.PoolName, err)
+					fmt.Fprintln(os.Stderr, "Aborting spindown to prevent data loss.")
+					os.Exit(1)
+				}
+
+				// Record in database
+				if database != nil {
+					if err := database.RecordPoolExport(pool.PoolName, pool.Serials, "spindown"); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to record pool export: %v\n", err)
+					}
+				}
+
+				exportedPools = append(exportedPools, pool.PoolName)
+				fmt.Printf("Pool '%s' exported successfully\n", pool.PoolName)
+			} else {
+				fmt.Printf("Skipping drives in pool '%s' (pool not exported)\n", pool.PoolName)
+				skippedDevices = append(skippedDevices, pool.Devices...)
+			}
+		}
+	}
+
+	// 6. Build list of drives to actually spindown
+	skipSet := make(map[string]bool)
+	for _, dev := range skippedDevices {
+		skipSet[dev] = true
+	}
+
+	var drivesToSpindown []config.Drive
+	for _, d := range drives {
+		if !skipSet[d.Device] {
+			drivesToSpindown = append(drivesToSpindown, d)
+		}
+	}
+
+	// 7. Spindown remaining drives
+	if len(drivesToSpindown) > 0 {
+		spindownDrives(drivesToSpindown)
+	} else {
+		fmt.Println("No drives to spin down after ZFS handling")
+	}
+
+	// 8. Summary
+	if len(exportedPools) > 0 {
+		fmt.Printf("\nExported pools: %s\n", strings.Join(exportedPools, ", "))
+		fmt.Println("Use 'jbodgod spinup' to re-import these pools automatically")
+	}
+
+	_ = nonZfsDrives // non-ZFS drives are included in drivesToSpindown
+}
+
+// spindownDrives is the core spindown logic
+func spindownDrives(drives []config.Drive) {
+	fmt.Printf("Spinning down %d drives...\n", len(drives))
+
+	var wg sync.WaitGroup
+	for _, d := range drives {
+		wg.Add(1)
+		go func(device string) {
+			defer wg.Done()
+			exec.Command("sdparm", "--command=stop", device).Run()
+		}(d.Device)
+	}
+	wg.Wait()
+
+	// Monitor progress
+	for i := 0; i < 30; i++ {
+		time.Sleep(time.Second)
+		stopped := 0
+		for _, d := range drives {
+			out, _ := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
+			if strings.Contains(string(out), "NOT READY") {
+				stopped++
+			}
+		}
+		fmt.Printf("\r  Progress: %d/%d drives in standby...", stopped, len(drives))
+		if stopped == len(drives) {
+			break
+		}
+	}
+	fmt.Println("\nAll drives in standby.")
+}
+
+// SpinupWithZFS performs ZFS-aware spinup
+func SpinupWithZFS(cfg *config.Config, controller string, devices []string, opts SpinupOptions) {
+	// 1. Resolve target drives (same logic as existing Spinup)
+	var drives []config.Drive
+
+	if len(devices) > 0 {
+		for _, dev := range devices {
+			drives = append(drives, config.Drive{Device: dev, Name: dev})
+		}
+	} else {
+		allDrives := cfg.GetAllDrives()
+		drives = filterDrivesByController(allDrives, controller)
+	}
+
+	if len(drives) == 0 {
+		if controller != "" {
+			fmt.Printf("No drives found for controller %s\n", controller)
+		} else {
+			fmt.Println("No drives found")
+		}
+		return
+	}
+
+	// 2. Spinup the drives first
+	spinupDrives(drives)
+
+	// 3. Skip import if requested
+	if opts.NoImport {
+		fmt.Println("--no-import specified: skipping pool re-import")
+		return
+	}
+
+	// 4. Wait for drives to stabilize
+	fmt.Println("Waiting for drives to stabilize...")
+	time.Sleep(3 * time.Second)
+
+	// 5. Check database for pools to import
+	database, dbErr := db.New("")
+	if dbErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: database unavailable, cannot auto-import pools: %v\n", dbErr)
+		return
+	}
+	defer database.Close()
+
+	// 6. Get serials of spun-up drives
+	var driveSerials []string
+	for _, d := range drives {
+		serial := zfs.GetDriveSerial(d.Device)
+		if serial != "" {
+			driveSerials = append(driveSerials, serial)
+		}
+	}
+
+	// 7. Find pools that need import based on spun-up drives
+	pendingPools, err := database.GetPendingImportsForDrives(driveSerials)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not check pending imports: %v\n", err)
+		return
+	}
+
+	if len(pendingPools) == 0 {
+		return
+	}
+
+	// 8. Import each pending pool
+	fmt.Printf("\nRe-importing %d pool(s)...\n", len(pendingPools))
+
+	for _, pool := range pendingPools {
+		fmt.Printf("Importing pool '%s'...\n", pool.PoolName)
+		if err := zfs.ImportPool(pool.PoolName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to import pool '%s': %v\n", pool.PoolName, err)
+			database.MarkPoolImported(pool.PoolName, "failed")
+			continue
+		}
+
+		database.MarkPoolImported(pool.PoolName, "success")
+		fmt.Printf("Pool '%s' imported successfully\n", pool.PoolName)
+	}
+}
+
+// spinupDrives is the core spinup logic
+func spinupDrives(drives []config.Drive) {
+	fmt.Printf("Spinning up %d drives...\n", len(drives))
 
 	var wg sync.WaitGroup
 	for _, d := range drives {
@@ -394,20 +867,21 @@ func checkDriveState(device string) string {
 
 	var state string
 
-	// Check for device access failures first
-	if err != nil {
+	// Check for standby FIRST - smartctl returns non-zero exit code for standby
+	// but this is not an error condition
+	if strings.Contains(output, "STANDBY") || strings.Contains(output, "NOT READY") {
+		state = "standby"
+	} else if err != nil {
+		// Check for device access failures
 		if strings.Contains(output, "No such device") ||
 			strings.Contains(output, "No such file") {
 			state = "missing"
-		} else if strings.Contains(output, "I/O error") ||
-			strings.Contains(output, "failed") {
+		} else if strings.Contains(output, "I/O error") {
 			state = "failed"
 		} else {
-			// Unknown error, mark as failed
+			// Other errors - mark as failed
 			state = "failed"
 		}
-	} else if strings.Contains(output, "NOT READY") {
-		state = "standby"
 	} else {
 		state = "active"
 	}
