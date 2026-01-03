@@ -6,6 +6,7 @@ import (
 
 	"github.com/sigreer/jbodgod/internal/config"
 	"github.com/sigreer/jbodgod/internal/drive"
+	"github.com/sigreer/jbodgod/internal/hba"
 	"github.com/sigreer/jbodgod/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -31,8 +32,22 @@ var versionCmd = &cobra.Command{
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show drive states and temperatures",
+	Long: `Display drive status including state, temperature, and pool membership.
+
+By default, shows core realtime data: device, slot, state, temperature, zpool.
+Use --detail to include additional information like model, serial, and more.
+
+The --json flag changes the output format without affecting the data shown.
+Combine --json with --detail for comprehensive JSON output.
+
+Examples:
+  jbodgod status              # Core data in table format
+  jbodgod status --json       # Core data in JSON format
+  jbodgod status --detail     # Detailed data in table format
+  jbodgod status --json --detail  # Full data in JSON format`,
 	Run: func(cmd *cobra.Command, args []string) {
 		jsonOut, _ := cmd.Flags().GetBool("json")
+		detail, _ := cmd.Flags().GetBool("detail")
 		cfg, err := config.Load(cfgFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
@@ -40,10 +55,14 @@ var statusCmd = &cobra.Command{
 		}
 		drives := drive.GetAll(cfg)
 		if jsonOut {
-			controllers, enclosures, _ := drive.FetchHBAData(false)
-			drive.PrintJSON(drives, controllers, enclosures)
+			var controllers []hba.ControllerInfo
+			var enclosures []hba.EnclosureInfo
+			if detail {
+				controllers, enclosures, _ = drive.FetchHBAData(false)
+			}
+			drive.PrintJSON(drives, controllers, enclosures, detail)
 		} else {
-			drive.PrintStatus(drives)
+			drive.PrintStatus(drives, detail)
 		}
 	},
 }
@@ -156,6 +175,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is /etc/jbodgod/config.yaml)")
 
 	statusCmd.Flags().Bool("json", false, "Output as JSON")
+	statusCmd.Flags().BoolP("detail", "d", false, "Include detailed drive information")
 
 	spindownCmd.Flags().StringP("controller", "c", "", "target specific controller (e.g., c0)")
 	spindownCmd.Flags().Bool("force", false, "skip ZFS pool checks (dangerous)")

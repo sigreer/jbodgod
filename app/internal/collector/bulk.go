@@ -23,27 +23,43 @@ func CollectSystemData(forceRefresh bool) *SystemData {
 	}
 
 	data := &SystemData{
-		LsblkDevices:  make(map[string]*LsblkDevice),
-		BlkidDevices:  make(map[string]*BlkidDevice),
-		LsscsiDevices: make(map[string]*LsscsiDevice),
-		ZpoolVdevs:    make(map[string]*ZpoolVdev),
-		LvmPVs:        make(map[string]*LvmPV),
-		ByIDLinks:     make(map[string]string),
-		Controllers:   make(map[string]*ControllerData),
-		HBADevices:    make(map[string]*HBADevice),
+		// Layer 1: Safe sources
+		SysfsDevices:    make(map[string]*SysfsDevice),
+		SysfsEnclosures: make(map[string]*SysfsEnclosure),
+		UdevDevices:     make(map[string]*UdevDevice),
+		LsblkDevices:    make(map[string]*LsblkDevice),
+		LsscsiDevices:   make(map[string]*LsscsiDevice),
+		ByIDLinks:       make(map[string]string),
+		// Layer 2: Storage stack
+		ZpoolVdevs: make(map[string]*ZpoolVdev),
+		LvmPVs:     make(map[string]*LvmPV),
+		// Layer 3: HBA (24h cached)
+		Controllers:  make(map[string]*ControllerData),
+		HBADevices:   make(map[string]*HBADevice),
+		// Deprecated
+		BlkidDevices: make(map[string]*BlkidDevice),
 	}
 
-	// Collect from all sources in parallel would be ideal,
-	// but for simplicity we do sequential with individual caching
-	collectLsblk(data)
-	collectBlkid(data)
-	collectLsscsi(data)
-	collectZpool(data)
-	collectLVM(data)
-	collectByID(data)
+	// === Layer 1: Safe sources (no drive wake, no process spawn or fast cached) ===
+	// These run on every call but are fast/cached
+	collectSysfs(data)       // Direct sysfs reads - fastest, no wake
+	collectUdev(data)        // Udev database reads - fast, no wake
+	collectLsblk(data)       // lsblk JSON - fast, no wake
+	collectLsscsi(data)      // lsscsi - fast, no wake
+	collectByID(data)        // /dev/disk/by-id symlinks - fast, no wake
+
+	// === Layer 2: Storage stack (no drive wake, but requires pool to be imported) ===
+	collectZpool(data)       // ZFS pool/vdev info from ARC cache
+	collectLVM(data)         // LVM metadata from cache
+
+	// === Layer 3: HBA bootstrap data (cached 24h, may wake drives on first call) ===
+	// Only refreshed once per day or on explicit --refresh
 	collectHBA(data)
 
-	c.SetFast(cacheKey, data)
+	// NOTE: blkid removed - it wakes sleeping drives
+	// NOTE: smartctl calls moved to per-device with state gating (see merge.go)
+
+	c.SetMedium(cacheKey, data) // 5 minute cache for bulk data
 	return data
 }
 
@@ -472,13 +488,56 @@ func collectByID(data *SystemData) {
 	c.SetSlow(cacheKey, links)
 }
 
+// collectSysfs integrates sysfs data into SystemData
+func collectSysfs(data *SystemData) {
+	sysfsDevices := CollectSysfsDevices()
+	data.SysfsDevices = sysfsDevices
+
+	sysfsEnclosures := CollectSysfsEnclosures()
+	data.SysfsEnclosures = sysfsEnclosures
+}
+
+// collectUdev integrates udev data into SystemData
+func collectUdev(data *SystemData) {
+	udevDevices := CollectUdevDevices()
+	data.UdevDevices = udevDevices
+}
+
 // collectHBA collects data from HBA tools
+// Uses 24-hour static cache since hardware topology rarely changes
 func collectHBA(data *SystemData) {
-	// Try storcli first (more detailed), fall back to sas3ircu
+	c := cache.Global()
+	cacheKey := "system:hba:combined"
+
+	// Check static cache first (24h TTL)
+	if cached := c.Get(cacheKey); cached != nil {
+		cachedData := cached.(*hbaCombinedCache)
+		for k, v := range cachedData.Devices {
+			data.HBADevices[k] = v
+		}
+		for k, v := range cachedData.Controllers {
+			data.Controllers[k] = v
+		}
+		return
+	}
+
+	// Try storcli first (more detailed, doesn't wake drives), fall back to sas3ircu
 	collectStorcli(data)
 	if len(data.HBADevices) == 0 {
 		collectSas3ircu(data)
 	}
+
+	// Cache combined result with static TTL (24h)
+	combinedCache := &hbaCombinedCache{
+		Devices:     data.HBADevices,
+		Controllers: data.Controllers,
+	}
+	c.SetStatic(cacheKey, combinedCache)
+}
+
+type hbaCombinedCache struct {
+	Devices     map[string]*HBADevice
+	Controllers map[string]*ControllerData
 }
 
 // collectStorcli parses storcli output

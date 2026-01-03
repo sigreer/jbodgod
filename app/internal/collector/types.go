@@ -94,14 +94,24 @@ type EnclosureData struct {
 
 // SystemData holds bulk-collected system information
 type SystemData struct {
-	LsblkDevices  map[string]*LsblkDevice  // keyed by device name (sda, sdb)
-	BlkidDevices  map[string]*BlkidDevice  // keyed by device path (/dev/sda1)
-	LsscsiDevices map[string]*LsscsiDevice // keyed by device path
-	ZpoolVdevs    map[string]*ZpoolVdev    // keyed by vdev GUID
-	LvmPVs        map[string]*LvmPV        // keyed by device path
-	ByIDLinks     map[string]string        // device path -> by-id path
-	Controllers   map[string]*ControllerData
-	HBADevices    map[string]*HBADevice    // keyed by serial
+	// Layer 1: Safe sources (no drive wake, fast)
+	SysfsDevices    map[string]*SysfsDevice    // keyed by device name (sda, sdb)
+	SysfsEnclosures map[string]*SysfsEnclosure // keyed by enclosure HCTL
+	UdevDevices     map[string]*UdevDevice     // keyed by device name
+	LsblkDevices    map[string]*LsblkDevice    // keyed by device name (sda, sdb)
+	LsscsiDevices   map[string]*LsscsiDevice   // keyed by device path
+	ByIDLinks       map[string]string          // device path -> by-id path
+
+	// Layer 2: Storage stack (no drive wake, but requires pools imported)
+	ZpoolVdevs map[string]*ZpoolVdev // keyed by vdev GUID
+	LvmPVs     map[string]*LvmPV     // keyed by device path
+
+	// Layer 3: HBA data (cached 24h, may wake on first call)
+	Controllers map[string]*ControllerData
+	HBADevices  map[string]*HBADevice // keyed by serial
+
+	// DEPRECATED: BlkidDevices removed - wakes sleeping drives
+	BlkidDevices map[string]*BlkidDevice // kept for compatibility, not populated
 }
 
 // LsblkDevice represents parsed lsblk output

@@ -81,17 +81,37 @@ type Summary struct {
 	Standby int  `json:"standby"`
 	Missing int  `json:"missing"`
 	Failed  int  `json:"failed"`
-	TempMin *int `json:"temp_min"`
-	TempMax *int `json:"temp_max"`
-	TempAvg *int `json:"temp_avg"`
+	TempMin *int `json:"temp_min,omitempty"`
+	TempMax *int `json:"temp_max,omitempty"`
+	TempAvg *int `json:"temp_avg,omitempty"`
 }
 
-type Output struct {
-	Drives      []DriveInfo         `json:"drives"`
-	Summary     Summary             `json:"summary"`
+// CoreDriveInfo contains essential realtime data (default output)
+type CoreDriveInfo struct {
+	Device  string  `json:"device"`
+	Name    string  `json:"name,omitempty"`
+	State   string  `json:"state"`
+	Temp    *int    `json:"temp,omitempty"`
+	Zpool   *string `json:"zpool,omitempty"`
+	Slot    string  `json:"slot,omitempty"` // formatted as "enc:slot"
+}
+
+// CoreOutput is the default output structure (realtime/essential data only)
+type CoreOutput struct {
+	Drives  []CoreDriveInfo `json:"drives"`
+	Summary Summary         `json:"summary"`
+}
+
+// DetailOutput includes full drive data plus controllers/enclosures
+type DetailOutput struct {
+	Drives      []DriveInfo          `json:"drives"`
+	Summary     Summary              `json:"summary"`
 	Controllers []hba.ControllerInfo `json:"controllers,omitempty"`
 	Enclosures  []hba.EnclosureInfo  `json:"enclosures,omitempty"`
 }
+
+// Output is an alias for DetailOutput for backwards compatibility
+type Output = DetailOutput
 
 func GetAll(cfg *config.Config) []DriveInfo {
 	drives := cfg.GetAllDrives()
@@ -286,21 +306,8 @@ func getZpoolInfo(device string) (pool, vdev string) {
 	return "", ""
 }
 
-func PrintStatus(drives []DriveInfo) {
-	fmt.Printf("%-10s %-10s %s\n", "DRIVE", "STATE", "TEMP")
-	fmt.Println("------------------------------")
-
-	for _, d := range drives {
-		temp := "-"
-		if d.Temp != nil {
-			temp = fmt.Sprintf("%d°C", *d.Temp)
-		}
-		state := strings.ToUpper(d.State)
-		fmt.Printf("%-10s %-10s %s\n", d.Device, state, temp)
-	}
-}
-
-func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures []hba.EnclosureInfo) {
+// BuildSummary calculates summary statistics from drive data
+func BuildSummary(drives []DriveInfo) Summary {
 	var active, standby, missing, failed int
 	var temps []int
 
@@ -318,7 +325,6 @@ func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures 
 		case "failed":
 			failed++
 		default:
-			// Unknown state, count as failed
 			failed++
 		}
 	}
@@ -347,16 +353,146 @@ func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures 
 		summary.TempAvg = &avg
 	}
 
-	output := Output{
-		Drives:      drives,
-		Summary:     summary,
-		Controllers: controllers,
-		Enclosures:  enclosures,
+	return summary
+}
+
+// DriveInfoToCore converts full DriveInfo to core (essential) data
+func DriveInfoToCore(d DriveInfo) CoreDriveInfo {
+	core := CoreDriveInfo{
+		Device: d.Device,
+		Name:   d.Name,
+		State:  d.State,
+		Temp:   d.Temp,
+		Zpool:  d.Zpool,
 	}
+	if d.Enclosure != nil && d.Slot != nil {
+		core.Slot = fmt.Sprintf("%d:%d", *d.Enclosure, *d.Slot)
+	}
+	return core
+}
+
+// PrintStatus prints drive status in table format
+// If detail is true, shows additional columns (model, serial, etc.)
+func PrintStatus(drives []DriveInfo, detail bool) {
+	if detail {
+		printDetailTable(drives)
+	} else {
+		printCoreTable(drives)
+	}
+
+	// Print summary
+	summary := BuildSummary(drives)
+	fmt.Println()
+	printSummary(summary)
+}
+
+func printCoreTable(drives []DriveInfo) {
+	fmt.Printf("%-10s %-8s %-10s %-6s %-12s\n", "DEVICE", "SLOT", "STATE", "TEMP", "ZPOOL")
+	fmt.Println(strings.Repeat("-", 52))
+
+	for _, d := range drives {
+		slot := "-"
+		if d.Enclosure != nil && d.Slot != nil {
+			slot = fmt.Sprintf("%d:%d", *d.Enclosure, *d.Slot)
+		}
+		temp := "-"
+		if d.Temp != nil {
+			temp = fmt.Sprintf("%d°C", *d.Temp)
+		}
+		zpool := "-"
+		if d.Zpool != nil {
+			zpool = *d.Zpool
+		}
+		fmt.Printf("%-10s %-8s %-10s %-6s %-12s\n",
+			d.Device, slot, strings.ToUpper(d.State), temp, zpool)
+	}
+}
+
+func printDetailTable(drives []DriveInfo) {
+	fmt.Printf("%-10s %-8s %-10s %-6s %-12s %-20s %-15s\n",
+		"DEVICE", "SLOT", "STATE", "TEMP", "ZPOOL", "MODEL", "SERIAL")
+	fmt.Println(strings.Repeat("-", 90))
+
+	for _, d := range drives {
+		slot := "-"
+		if d.Enclosure != nil && d.Slot != nil {
+			slot = fmt.Sprintf("%d:%d", *d.Enclosure, *d.Slot)
+		}
+		temp := "-"
+		if d.Temp != nil {
+			temp = fmt.Sprintf("%d°C", *d.Temp)
+		}
+		zpool := "-"
+		if d.Zpool != nil {
+			zpool = *d.Zpool
+		}
+		model := "-"
+		if d.Model != nil {
+			model = truncate(*d.Model, 18)
+		}
+		serial := "-"
+		if d.Serial != nil {
+			serial = truncate(*d.Serial, 13)
+		}
+		fmt.Printf("%-10s %-8s %-10s %-6s %-12s %-20s %-15s\n",
+			d.Device, slot, strings.ToUpper(d.State), temp, zpool, model, serial)
+	}
+}
+
+func printSummary(summary Summary) {
+	parts := []string{
+		fmt.Sprintf("Active: %d", summary.Active),
+		fmt.Sprintf("Standby: %d", summary.Standby),
+	}
+	if summary.Missing > 0 {
+		parts = append(parts, fmt.Sprintf("Missing: %d", summary.Missing))
+	}
+	if summary.Failed > 0 {
+		parts = append(parts, fmt.Sprintf("Failed: %d", summary.Failed))
+	}
+	fmt.Println(strings.Join(parts, " | "))
+
+	if summary.TempMin != nil && summary.TempMax != nil && summary.TempAvg != nil {
+		fmt.Printf("Temps: Min %d°C | Max %d°C | Avg %d°C\n",
+			*summary.TempMin, *summary.TempMax, *summary.TempAvg)
+	}
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-2] + ".."
+}
+
+// PrintJSON outputs drive data as JSON
+// If detail is true, includes full DriveInfo plus controllers/enclosures
+// If detail is false, outputs only core data
+func PrintJSON(drives []DriveInfo, controllers []hba.ControllerInfo, enclosures []hba.EnclosureInfo, detail bool) {
+	summary := BuildSummary(drives)
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	enc.Encode(output)
+
+	if detail {
+		output := DetailOutput{
+			Drives:      drives,
+			Summary:     summary,
+			Controllers: controllers,
+			Enclosures:  enclosures,
+		}
+		enc.Encode(output)
+	} else {
+		coreDrives := make([]CoreDriveInfo, len(drives))
+		for i, d := range drives {
+			coreDrives[i] = DriveInfoToCore(d)
+		}
+		output := CoreOutput{
+			Drives:  coreDrives,
+			Summary: summary,
+		}
+		enc.Encode(output)
+	}
 }
 
 // filterDrivesByController returns only drives attached to the specified controller.
@@ -433,32 +569,8 @@ func Spindown(cfg *config.Config, controller string, devices []string) {
 		}
 	}
 
-	var wg sync.WaitGroup
-	for _, d := range drives {
-		wg.Add(1)
-		go func(device string) {
-			defer wg.Done()
-			exec.Command("sdparm", "--command=stop", device).Run()
-		}(d.Device)
-	}
-	wg.Wait()
-
-	// Monitor progress
-	for i := 0; i < 30; i++ {
-		time.Sleep(time.Second)
-		stopped := 0
-		for _, d := range drives {
-			out, _ := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
-			if strings.Contains(string(out), "NOT READY") {
-				stopped++
-			}
-		}
-		fmt.Printf("\r  Progress: %d/%d drives in standby...", stopped, len(drives))
-		if stopped == len(drives) {
-			break
-		}
-	}
-	fmt.Println("\nAll drives in standby.")
+	// Use the common spindown logic
+	spindownDrives(drives)
 }
 
 func Spinup(cfg *config.Config, controller string, devices []string) {
@@ -491,32 +603,8 @@ func Spinup(cfg *config.Config, controller string, devices []string) {
 		}
 	}
 
-	var wg sync.WaitGroup
-	for _, d := range drives {
-		wg.Add(1)
-		go func(device string) {
-			defer wg.Done()
-			exec.Command("sdparm", "--command=start", device).Run()
-		}(d.Device)
-	}
-	wg.Wait()
-
-	// Monitor progress
-	for i := 0; i < 60; i++ {
-		time.Sleep(time.Second)
-		active := 0
-		for _, d := range drives {
-			out, _ := exec.Command("smartctl", "-i", "-n", "standby", d.Device).CombinedOutput()
-			if !strings.Contains(string(out), "NOT READY") {
-				active++
-			}
-		}
-		fmt.Printf("\r  Progress: %d/%d drives active...", active, len(drives))
-		if active == len(drives) {
-			break
-		}
-	}
-	fmt.Println("\nAll drives active.")
+	// Use the common spinup logic
+	spinupDrives(drives)
 }
 
 // SpindownOptions controls spindown behavior
@@ -655,17 +743,41 @@ func SpindownWithZFS(cfg *config.Config, controller string, devices []string, op
 func spindownDrives(drives []config.Drive) {
 	fmt.Printf("Spinning down %d drives...\n", len(drives))
 
+	// Track sdparm command results
 	var wg sync.WaitGroup
-	for _, d := range drives {
+	spindownErrors := make([]string, len(drives))
+	var errorMu sync.Mutex
+
+	for i, d := range drives {
 		wg.Add(1)
-		go func(device string) {
+		go func(idx int, device string) {
 			defer wg.Done()
-			exec.Command("sdparm", "--command=stop", device).Run()
-		}(d.Device)
+			cmd := exec.Command("sdparm", "--command=stop", device)
+			if err := cmd.Run(); err != nil {
+				errorMu.Lock()
+				spindownErrors[idx] = fmt.Sprintf("%s: %v", device, err)
+				errorMu.Unlock()
+			}
+		}(i, d.Device)
 	}
 	wg.Wait()
 
+	// Report any sdparm errors
+	var failedCmds []string
+	for _, errMsg := range spindownErrors {
+		if errMsg != "" {
+			failedCmds = append(failedCmds, errMsg)
+		}
+	}
+	if len(failedCmds) > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: sdparm failed for %d drive(s):\n", len(failedCmds))
+		for _, e := range failedCmds {
+			fmt.Fprintf(os.Stderr, "  %s\n", e)
+		}
+	}
+
 	// Monitor progress
+	var finalStopped int
 	for i := 0; i < 30; i++ {
 		time.Sleep(time.Second)
 		stopped := 0
@@ -676,11 +788,19 @@ func spindownDrives(drives []config.Drive) {
 			}
 		}
 		fmt.Printf("\r  Progress: %d/%d drives in standby...", stopped, len(drives))
+		finalStopped = stopped
 		if stopped == len(drives) {
 			break
 		}
 	}
-	fmt.Println("\nAll drives in standby.")
+
+	// Report actual result
+	if finalStopped == len(drives) {
+		fmt.Println("\nAll drives in standby.")
+	} else {
+		fmt.Printf("\nWarning: Only %d/%d drives entered standby.\n", finalStopped, len(drives))
+		fmt.Println("Some drives may not support spindown or may have failed to respond.")
+	}
 }
 
 // SpinupWithZFS performs ZFS-aware spinup
